@@ -1,0 +1,41 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: sb_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: brain_user
+      POSTGRES_PASSWORD: brain_password
+      POSTGRES_DB: second_brain
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: sb_ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./ollama_models:/root/.ollama
+
+  app:
+    build: ./app
+    container_name: sb_app
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./app:/app
+      - ./docs:/docs
+    depends_on:
+      - db
+      - ollama
+    environment:
+      DB_HOST: db
+      DB_NAME: second_brain
+      DB_USER: brain_user
+      DB_PASS: brain_password
+      OLLAMA_URL: http://ollama:11434
