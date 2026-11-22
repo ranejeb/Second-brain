@@ -1,6 +1,7 @@
 import os
 import pandas as pd
 from pypdf import PdfReader
+from docx import Document
 from database import get_conn, init_db
 from llm import get_embedding
 
@@ -12,6 +13,9 @@ def extract_text(filepath: str) -> str:
     if ext == ".pdf":
         reader = PdfReader(filepath)
         return "\n".join(page.extract_text() or "" for page in reader.pages)
+    elif ext == ".docx":
+        doc = Document(filepath)
+        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
     elif ext in [".txt", ".md"]:
         with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
             return f.read()

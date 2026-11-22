@@ -102,7 +102,7 @@ with st.sidebar:
 
     uploaded_files = st.file_uploader(
         "Добавить PDF / TXT / MD",
-        type=["pdf", "txt", "md"],
+        type=["pdf", "txt", "md", "docx"],
         accept_multiple_files=True,
         key=f"uploader_{active_col}",
         label_visibility="collapsed"
