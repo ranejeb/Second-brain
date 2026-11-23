@@ -12,9 +12,54 @@ def get_embedding(text: str) -> list[float]:
         timeout=60
     )
     resp.raise_for_status()
-    data = resp.json()
-    first_vector, *_ = data["embeddings"]
-    return first_vector
+    return resp.json()["embeddings"]
+
+def get_embeddings_batch(texts: list[str], batch_size: int = 15) -> list[list[float]]:
+    all_embeddings = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        resp = requests.post(
+            f"{OLLAMA_URL}/api/embed",
+            json={"model": "nomic-embed-text", "input": batch},
+            timeout=180
+        )
+        resp.raise_for_status()
+        all_embeddings.extend(resp.json()["embeddings"])
+    return all_embeddings
+
+def rewrite_query_with_history(model_name: str, query: str, history: list[dict]) -> str:
+    if not history:
+        return query
+    
+    # Берем последние 2 пары сообщений для контекста
+    recent = history[-4:]
+    dialog_text = "\n".join(f"{'Пользователь' if m['role']=='user' else 'Ассистент'}: {m['content'][:300]}" for m in recent)
+    
+    prompt = f"""Перепиши последний вопрос пользователя так, чтобы он был полностью понятен без истории диалога (замени местоимения "он", "это", "там" на конкретные термины из диалога).
+Если вопрос уже самодостаточный, верни его без изменений. Верни ТОЛЬКО итоговый вопрос одной строкой, без пояснений.
+
+История:
+{dialog_text}
+
+Последний вопрос: {query}
+Самодостаточный вопрос:"""
+
+    try:
+        resp = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model": model_name,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.0, "num_predict": 80}
+            },
+            timeout=45
+        )
+        resp.raise_for_status()
+        rewritten = resp.json().get("response", "").strip().strip('"')
+        return rewritten if len(rewritten) > 3 else query
+    except Exception:
+        return query
 
 def build_rag_prompt(context: str, query: str) -> str:
     return f"""Ты строгий аналитик. Ответь на вопрос ТОЛЬКО фактами из текста ниже.

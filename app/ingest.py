@@ -1,9 +1,10 @@
 import os
+import re
 import pandas as pd
 from pypdf import PdfReader
 from docx import Document
 from database import get_conn, init_db
-from llm import get_embedding
+from llm import get_embeddings_batch
 
 DOCS_DIR = "/docs"
 
@@ -12,24 +13,47 @@ def extract_text(filepath: str) -> str:
     ext = raw_ext.lower()
     if ext == ".pdf":
         reader = PdfReader(filepath)
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
+        return "\n\n".join(page.extract_text() or "" for page in reader.pages)
     elif ext == ".docx":
         doc = Document(filepath)
-        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
     elif ext in [".txt", ".md"]:
         with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
             return f.read()
     return ""
 
-def split_into_chunks(text: str, chunk_size: int = 800, overlap: int = 150) -> list[str]:
-    text = " ".join(text.split())
+def split_into_chunks(text: str, max_chars: int = 900, overlap_sentences: int = 1) -> list[str]:
+    # Нормализуем переносы строк, сохраняя границы абзацев
+    paragraphs = [re.sub(r"[ \t]+", " ", p).strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    
+    # Разбиваем крупные абзацы на предложения
+    sentences = []
+    for p in paragraphs:
+        if len(p) <= max_chars:
+            sentences.append(p)
+        else:
+            sents = re.split(r"(?<=[.!?])\s+", p)
+            sentences.extend(s.strip() for s in sents if s.strip())
+
     chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start += chunk_size - overlap
-    return [c for c in chunks if len(c.strip()) > 50]
+    current_chunk = []
+    current_len = 0
+
+    for sent in sentences:
+        sent_len = len(sent)
+        if current_len + sent_len > max_chars and current_chunk:
+            chunks.append(" ".join(current_chunk))
+            # Оставляем последние N предложений для смыслового перекрытия
+            current_chunk = current_chunk[-overlap_sentences:] if overlap_sentences > 0 else []
+            current_len = sum(len(s) for s in current_chunk)
+        
+        current_chunk.append(sent)
+        current_len += sent_len + 1
+
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+
+    return [c for c in chunks if len(c.strip()) > 40]
 
 def run_pipeline(collection: str = "Общая") -> int:
     target_dir = os.path.join(DOCS_DIR, collection)
@@ -75,10 +99,11 @@ def run_pipeline(collection: str = "Общая") -> int:
             return 0
 
         df = pd.DataFrame(new_records)
+        # Пакетная векторизация всех чанков (в 3-4 раза быстрее одиночных запросов)
+        embeddings = get_embeddings_batch(df["content"].tolist(), batch_size=15)
         
         with conn.cursor() as cur:
-            for _, row in df.iterrows():
-                emb = get_embedding(row["content"])
+            for (_, row), emb in zip(df.iterrows(), embeddings):
                 cur.execute(
                     """
                     INSERT INTO knowledge_chunks 

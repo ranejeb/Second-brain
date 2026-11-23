@@ -12,7 +12,7 @@ from database import (
     get_indexed_files, delete_file_chunks, search_similar_chunks,
     get_analytics_df, load_chat_history, save_chat_message, clear_chat_history
 )
-from llm import get_embedding, build_rag_prompt, stream_ollama_response
+from llm import get_embedding, rewrite_query_with_history, build_rag_prompt, stream_ollama_response
 from ingest import run_pipeline, DOCS_DIR
 
 st.set_page_config(
@@ -169,11 +169,15 @@ with tab_chat:
             status = st.status(f"Ищу в пространстве «{active_col}»...", expanded=True)
             
             with status:
-                st.markdown(":material/hub: Перевожу вопрос в вектор (`nomic-embed-text`)...")
-                q_emb = get_embedding(query)
+                search_query = rewrite_query_with_history(selected_model, query, messages)
+                if search_query != query:
+                    st.markdown(f":material/auto_fix_high: Уточнённый запрос с учётом контекста: *{search_query}*")
                 
-                st.markdown(":material/database: Выполняю изолированный векторный поиск в PostgreSQL...")
-                df_res = search_similar_chunks(active_col, q_emb, query_text=query, limit=4)
+                st.markdown(":material/hub: Перевожу запрос в вектор (`nomic-embed-text`)...")
+                q_emb = get_embedding(search_query)
+                
+                st.markdown(":material/database: Выполняю гибридный поиск (Векторы + FTS) в PostgreSQL...")
+                df_res = search_similar_chunks(active_col, q_emb, query_text=search_query, limit=4)
                 
                 if df_res.empty:
                     status.update(label=f"В пуле «{active_col}» пока нет документов", state="error", expanded=False)

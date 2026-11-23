@@ -1,6 +1,5 @@
 import json
 import os
-import re
 import pandas as pd
 import psycopg
 
@@ -39,6 +38,7 @@ def init_db():
             """)
             cur.execute("ALTER TABLE knowledge_chunks ADD COLUMN IF NOT EXISTS collection TEXT NOT NULL DEFAULT 'Общая';")
             cur.execute("ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS collection TEXT NOT NULL DEFAULT 'Общая';")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_fts ON knowledge_chunks USING GIN (to_tsvector('russian', content));")
         conn.commit()
 
 def get_db_collections() -> set[str]:
@@ -77,12 +77,8 @@ def delete_file_chunks(collection: str, filename: str):
         conn.commit()
 
 def search_similar_chunks(collection: str, query_embedding: list[float], query_text: str = "", limit: int = 4) -> pd.DataFrame:
-    # Вытаскиваем ключевые слова длиннее 3 символов для точного совпадения
-    keywords = [w for w in re.findall(r"[а-яa-z0-9_]{4,}", query_text.lower()) if w not in {"какие", "такое", "работает", "первые", "вопросы", "расскажи", "объясни"}]
-    
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # Если спрашивают про начало ("первые", "начало", "список"), захватываем первые чанки
             if any(word in query_text.lower() for word in ["первы", "начал", "оглавлен", "список"]):
                 cur.execute(
                     """
@@ -98,32 +94,21 @@ def search_similar_chunks(collection: str, query_embedding: list[float], query_t
                 if rows:
                     return pd.DataFrame(rows, columns=["filename", "chunk_index", "content", "similarity"])
 
-            # Гибридный поиск: даем бонус (+0.15) за точное вхождение ключевого слова в текст
-            if keywords:
-                like_pattern = f"%{keywords}%"
-                cur.execute(
-                    """
-                    SELECT filename, chunk_index, content,
-                           LEAST(1.0, (1 - (embedding <=> %s::vector)) + CASE WHEN content ILIKE %s THEN 0.15 ELSE 0 END) AS similarity
-                    FROM knowledge_chunks
-                    WHERE collection = %s
-                    ORDER BY similarity DESC
-                    LIMIT %s
-                    """,
-                    (str(query_embedding), like_pattern, collection, limit)
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT filename, chunk_index, content, 
-                           1 - (embedding <=> %s::vector) AS similarity
-                    FROM knowledge_chunks
-                    WHERE collection = %s
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s
-                    """,
-                    (str(query_embedding), collection, str(query_embedding), limit)
-                )
+            # Настоящий гибридный поиск: Косинусное сходство + Полнотекстовый ранг PostgreSQL (ts_rank)
+            cur.execute(
+                """
+                SELECT filename, chunk_index, content,
+                       LEAST(1.0, 
+                           (1 - (embedding <=> %s::vector)) + 
+                           0.25 * ts_rank(to_tsvector('russian', content), plainto_tsquery('russian', %s))
+                       ) AS similarity
+                FROM knowledge_chunks
+                WHERE collection = %s
+                ORDER BY similarity DESC
+                LIMIT %s
+                """,
+                (str(query_embedding), query_text, collection, limit)
+            )
             rows = cur.fetchall()
     return pd.DataFrame(rows, columns=["filename", "chunk_index", "content", "similarity"])
 
