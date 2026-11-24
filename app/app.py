@@ -12,7 +12,7 @@ from database import (
     get_indexed_files, delete_file_chunks, search_similar_chunks,
     get_analytics_df, load_chat_history, save_chat_message, clear_chat_history
 )
-from llm import get_embedding, rewrite_query_with_history, build_rag_prompt, stream_ollama_response
+from llm import PROMPT_MODES, get_embedding, rewrite_query_with_history, build_rag_prompt, stream_ollama_response
 from ingest import run_pipeline, DOCS_DIR
 
 st.set_page_config(
@@ -53,88 +53,8 @@ def render_sources(sources_list: list[dict]):
             with st.container(border=True):
                 st.markdown(f":material/description: **{src['filename']}** · Фрагмент `#{src['chunk_index']}` · Схожесть: `{score_pct}%`")
                 st.caption(src["content"])
-with st.sidebar:
-    st.markdown("### :material/neurology: Второй Мозг")
-    
-    # Компактный выбор пространства + всплывающее меню управления
-    col_ws, col_btn = st.columns((5, 1))
-    with col_ws:
-        active_col = st.selectbox(
-            "Пространство:",
-            get_all_collections(),
-            label_visibility="collapsed"
-        )
-    with col_btn:
-        with st.popover("", icon=":material/more_vert:", help="Управление пространствами"):
-            st.markdown("**Новое пространство**")
-            new_col_name = st.text_input("Название", placeholder="Например: SQL", label_visibility="collapsed")
-            if st.button("Создать", icon=":material/add:", use_container_width=True):
-                clean_name = re.sub(r"[^\w\s-]", "", new_col_name).strip()
-                if clean_name:
-                    os.makedirs(os.path.join(DOCS_DIR, clean_name), exist_ok=True)
-                    st.rerun()
-            if active_col != "Общая":
-                st.divider()
-                if st.button(f"Удалить «{active_col}»", icon=":material/delete:", use_container_width=True):
-                    delete_collection_data(active_col)
-                    col_dir = os.path.join(DOCS_DIR, active_col)
-                    if os.path.exists(col_dir):
-                        shutil.rmtree(col_dir)
-                    st.rerun()
-
-    st.caption(f":material/folder: Документы пула **{active_col}**")
-
-    # Компактный список файлов в аккуратной рамке
-    indexed_files = get_indexed_files(active_col)
-    if indexed_files:
-        with st.container(border=True):
-            for fname, cnt in indexed_files:
-                c1, c2 = st.columns((5, 1))
-                c1.markdown(f"<span style='font-size:0.85rem;'>�� {fname} <span style='color:#8B949E;'>({cnt})</span></span>", unsafe_allow_html=True)
-                if c2.button("", icon=":material/close:", key=f"del_{active_col}_{fname}", help="Удалить"):
-                    delete_file_chunks(active_col, fname)
-                    for p in [os.path.join(DOCS_DIR, active_col, fname), os.path.join(DOCS_DIR, fname)]:
-                        if os.path.exists(p):
-                            os.remove(p)
-                    st.rerun()
-    else:
-        st.info("Пул пуст. Загрузите файлы ниже.", icon=":material/upload_file:")
-
-    uploaded_files = st.file_uploader(
-        "Добавить PDF / TXT / MD",
-        type=["pdf", "txt", "md", "docx"],
-        accept_multiple_files=True,
-        key=f"uploader_{active_col}",
-        label_visibility="collapsed"
-    )
-    if uploaded_files:
-        target_dir = os.path.join(DOCS_DIR, active_col)
-        os.makedirs(target_dir, exist_ok=True)
-        saved_count = 0
-        for uf in uploaded_files:
-            save_path = os.path.join(target_dir, uf.name)
-            if not os.path.exists(save_path):
-                with open(save_path, "wb") as f:
-                    f.write(uf.getbuffer())
-                saved_count += 1
-        if saved_count > 0:
-            with st.status("Индексация...", expanded=False) as status:
-                added = run_pipeline(active_col)
-                status.update(label=f"Готово (+{added} блоков)", state="complete")
-            st.rerun()
-
-    st.divider()
-
-    # Нижняя панель действий в один ряд (Настройки в поповере + Очистка чата)
-    b1, b2 = st.columns(2)
-    with b1:
-        with st.popover("Модель", icon=":material/tune:", use_container_width=True):
-            selected_model = st.selectbox("Нейросеть:", ["qwen2.5:3b", "qwen2.5:0.5b"])
-            min_similarity = st.slider("Точность (%):", 10, 80, 35)
-    with b2:
-        if st.button("Очистить", icon=":material/delete_sweep:", use_container_width=True, help="Очистить чат"):
-            clear_chat_history(active_col)
-            st.rerun()
+from sidebar import render_sidebar
+active_col, selected_model, answer_mode, min_similarity = render_sidebar()
 
 st.markdown(f"# :material/neurology: Второй Мозг · `{active_col}`")
 st.caption(f"Изолированный поиск только по документам пространства «{active_col}»")
@@ -206,7 +126,7 @@ with tab_chat:
                     f"[Файл: {r['filename']}]\n{r['content']}" 
                     for _, r in df_res.iterrows()
                 )
-                prompt = build_rag_prompt(context, query)
+                prompt = build_rag_prompt(context, query, mode=answer_mode)
                 full_answer = st.write_stream(stream_ollama_response(selected_model, prompt, status, start_time))
                 sources_data = df_res.to_dict("records")
                 render_sources(sources_data)

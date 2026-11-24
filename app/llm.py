@@ -5,38 +5,30 @@ import requests
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 
+PROMPT_MODES = {
+    "Точный факт-чек": "Ответь максимально кратко и строго по фактам из текста. Без воды.",
+    "Подробный разбор": "Дай развёрнутый, понятный и хорошо структурированный ответ с примерами, опираясь на текст.",
+    "Конспект (тезисы)": "Выдели главные мысли из текста в виде чёткого маркированного списка."
+}
+
 def get_embedding(text: str) -> list[float]:
     resp = requests.post(
         f"{OLLAMA_URL}/api/embed",
-        json={"model": "nomic-embed-text", "input": text},
+        json={"model": "nomic-embed-text", "input": text, "keep_alive": "15m"},
         timeout=60
     )
     resp.raise_for_status()
-    return resp.json()["embeddings"]
-
-def get_embeddings_batch(texts: list[str], batch_size: int = 15) -> list[list[float]]:
-    all_embeddings = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        resp = requests.post(
-            f"{OLLAMA_URL}/api/embed",
-            json={"model": "nomic-embed-text", "input": batch},
-            timeout=180
-        )
-        resp.raise_for_status()
-        all_embeddings.extend(resp.json()["embeddings"])
-    return all_embeddings
+    return resp.json()["embeddings"][0]
 
 def rewrite_query_with_history(model_name: str, query: str, history: list[dict]) -> str:
     if not history:
         return query
     
-    # Берем последние 2 пары сообщений для контекста
     recent = history[-4:]
-    dialog_text = "\n".join(f"{'Пользователь' if m['role']=='user' else 'Ассистент'}: {m['content'][:300]}" for m in recent)
+    dialog_text = "\n".join(f"{'Пользователь' if m['role']=='user' else 'Ассистент'}: {m['content'][:250]}" for m in recent)
     
-    prompt = f"""Перепиши последний вопрос пользователя так, чтобы он был полностью понятен без истории диалога (замени местоимения "он", "это", "там" на конкретные термины из диалога).
-Если вопрос уже самодостаточный, верни его без изменений. Верни ТОЛЬКО итоговый вопрос одной строкой, без пояснений.
+    prompt = f"""Перепиши последний вопрос так, чтобы он был понятен без истории диалога (замени "он", "это", "там" на точные термины).
+Если вопрос уже самодостаточный, верни его без изменений. Верни ТОЛЬКО итоговый вопрос одной строкой.
 
 История:
 {dialog_text}
@@ -51,7 +43,8 @@ def rewrite_query_with_history(model_name: str, query: str, history: list[dict])
                 "model": model_name,
                 "prompt": prompt,
                 "stream": False,
-                "options": {"temperature": 0.0, "num_predict": 80}
+                "keep_alive": "15m",
+                "options": {"temperature": 0.0, "num_ctx": 1024, "num_predict": 70}
             },
             timeout=45
         )
@@ -61,12 +54,14 @@ def rewrite_query_with_history(model_name: str, query: str, history: list[dict])
     except Exception:
         return query
 
-def build_rag_prompt(context: str, query: str) -> str:
-    return f"""Ты строгий аналитик. Ответь на вопрос ТОЛЬКО фактами из текста ниже.
+def build_rag_prompt(context: str, query: str, mode: str = "Точный факт-чек") -> str:
+    style_instruction = PROMPT_MODES.get(mode, PROMPT_MODES["Точный факт-чек"])
+    return f"""Ты аналитический ассистент. Ответь на вопрос ТОЛЬКО на основе приведённого текста.
+Стиль ответа: {style_instruction}
 Правила:
-1. Не придумывай ничего от себя.
-2. Если в тексте нет прямого ответа на вопрос, напиши ровно одну фразу: "В предоставленных фрагментах ответа нет."
-3. Отвечай на русском языке кратко и структурированно.
+1. Не придумывай факты, которых нет в тексте.
+2. Если ответа в тексте нет, напиши ровно одну фразу: "В предоставленных фрагментах ответа нет."
+3. Отвечай на русском языке.
 
 Текст:
 {context}
@@ -81,7 +76,12 @@ def stream_ollama_response(model_name: str, prompt_text: str, status_box=None, s
             "model": model_name,
             "prompt": prompt_text,
             "stream": True,
-            "options": {"temperature": 0.1, "top_p": 0.9}
+            "keep_alive": "15m",
+            "options": {
+                "temperature": 0.1,
+                "top_p": 0.9,
+                "num_ctx": 2048  # Экономит ОЗУ и ускоряет старт ответа на CPU
+            }
         },
         stream=True,
         timeout=(10, 300)
@@ -95,7 +95,7 @@ def stream_ollama_response(model_name: str, prompt_text: str, status_box=None, s
                 if first_token and status_box is not None and start_ts is not None:
                     wait_sec = round(time.time() - start_ts, 1)
                     status_box.update(
-                        label=f"Ответ готов (поиск и подготовка: {wait_sec} сек)",
+                        label=f"Ответ готов (подготовка: {wait_sec} сек)",
                         state="complete",
                         expanded=False
                     )

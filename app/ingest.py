@@ -1,10 +1,11 @@
 import os
 import re
+import requests
 import pandas as pd
 from pypdf import PdfReader
 from docx import Document
 from database import get_conn, init_db
-from llm import get_embeddings_batch
+from llm import OLLAMA_URL
 
 DOCS_DIR = "/docs"
 
@@ -23,10 +24,7 @@ def extract_text(filepath: str) -> str:
     return ""
 
 def split_into_chunks(text: str, max_chars: int = 900, overlap_sentences: int = 1) -> list[str]:
-    # Нормализуем переносы строк, сохраняя границы абзацев
     paragraphs = [re.sub(r"[ \t]+", " ", p).strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-    
-    # Разбиваем крупные абзацы на предложения
     sentences = []
     for p in paragraphs:
         if len(p) <= max_chars:
@@ -43,10 +41,8 @@ def split_into_chunks(text: str, max_chars: int = 900, overlap_sentences: int = 
         sent_len = len(sent)
         if current_len + sent_len > max_chars and current_chunk:
             chunks.append(" ".join(current_chunk))
-            # Оставляем последние N предложений для смыслового перекрытия
             current_chunk = current_chunk[-overlap_sentences:] if overlap_sentences > 0 else []
             current_len = sum(len(s) for s in current_chunk)
-        
         current_chunk.append(sent)
         current_len += sent_len + 1
 
@@ -55,7 +51,7 @@ def split_into_chunks(text: str, max_chars: int = 900, overlap_sentences: int = 
 
     return [c for c in chunks if len(c.strip()) > 40]
 
-def run_pipeline(collection: str = "Общая") -> int:
+def run_pipeline(collection: str = "Общая", progress_callback=None) -> int:
     target_dir = os.path.join(DOCS_DIR, collection)
     os.makedirs(target_dir, exist_ok=True)
     
@@ -99,11 +95,27 @@ def run_pipeline(collection: str = "Общая") -> int:
             return 0
 
         df = pd.DataFrame(new_records)
-        # Пакетная векторизация всех чанков (в 3-4 раза быстрее одиночных запросов)
-        embeddings = get_embeddings_batch(df["content"].tolist(), batch_size=15)
+        texts = df["content"].tolist()
+        total = len(texts)
+        batch_size = 15
+        all_embeddings = []
+
+        for i in range(0, total, batch_size):
+            batch = texts[i:i + batch_size]
+            resp = requests.post(
+                f"{OLLAMA_URL}/api/embed",
+                json={"model": "nomic-embed-text", "input": batch},
+                timeout=180
+            )
+            resp.raise_for_status()
+            all_embeddings.extend(resp.json()["embeddings"])
+            
+            if progress_callback:
+                done = min(i + batch_size, total)
+                progress_callback(done / total, f"Векторизация: {done} из {total} блоков ({int(done / total * 100)}%)")
         
         with conn.cursor() as cur:
-            for (_, row), emb in zip(df.iterrows(), embeddings):
+            for (_, row), emb in zip(df.iterrows(), all_embeddings):
                 cur.execute(
                     """
                     INSERT INTO knowledge_chunks 
@@ -114,4 +126,4 @@ def run_pipeline(collection: str = "Общая") -> int:
                      row["content"], row["char_count"], row["word_count"], str(emb))
                 )
         conn.commit()
-        return len(df)
+        return total
