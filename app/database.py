@@ -12,6 +12,7 @@ def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS knowledge_chunks (
                     id SERIAL PRIMARY KEY,
@@ -41,10 +42,13 @@ def init_db():
             cur.execute("ALTER TABLE knowledge_chunks ADD COLUMN IF NOT EXISTS file_hash TEXT;")
             cur.execute("ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS collection TEXT NOT NULL DEFAULT 'Общая';")
             
-            # Индексы для ускорения фильтрации, полнотекстового и векторного поиска
             cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_collection ON knowledge_chunks (collection);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_hash ON knowledge_chunks (file_hash);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_fts ON knowledge_chunks USING GIN (to_tsvector('russian', content));")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_trgm ON knowledge_chunks USING GIN (content gin_trgm_ops);")
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_chunks_fts ON knowledge_chunks 
+                USING GIN ((to_tsvector('russian', content) || to_tsvector('simple', content)));
+            """)
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_chunks_hnsw ON knowledge_chunks 
                 USING hnsw (embedding vector_cosine_ops) 
@@ -53,23 +57,16 @@ def init_db():
         conn.commit()
 
 def clone_chunks_by_hash(file_hash: str, target_collection: str, new_filename: str, file_ext: str) -> int:
-    """Мгновенно копирует уже посчитанные векторы, если такой файл по SHA-256 уже есть в БД."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                SELECT chunk_index, content, char_count, word_count, embedding
-                FROM knowledge_chunks
-                WHERE file_hash = %s
-                ORDER BY chunk_index ASC
-                """,
+                "SELECT chunk_index, content, char_count, word_count, embedding FROM knowledge_chunks WHERE file_hash = %s ORDER BY chunk_index ASC",
                 (file_hash,)
             )
             rows = cur.fetchall()
             if not rows:
                 return 0
             
-            # Берем уникальный набор чанков одного файла-источника
             seen_idx = set()
             inserted = 0
             for c_idx, content, c_cnt, w_cnt, emb in rows:
@@ -141,19 +138,38 @@ def search_similar_chunks(collection: str, query_embedding: list[float], query_t
                 if rows:
                     return pd.DataFrame(rows, columns=["filename", "chunk_index", "content", "similarity"])
 
+            # Reciprocal Rank Fusion (RRF): объединение векторного поиска и двуязычного FTS + триграммы
             cur.execute(
                 """
-                SELECT filename, chunk_index, content,
-                       LEAST(1.0, 
-                           (1 - (embedding <=> %s::vector)) + 
-                           0.25 * ts_rank(to_tsvector('russian', content), plainto_tsquery('russian', %s))
-                       ) AS similarity
-                FROM knowledge_chunks
-                WHERE collection = %s
-                ORDER BY similarity DESC
+                WITH vector_search AS (
+                    SELECT id, filename, chunk_index, content,
+                           1 - (embedding <=> %s::vector) AS vec_sim,
+                           ROW_NUMBER() OVER (ORDER BY embedding <=> %s::vector) AS vec_rank
+                    FROM knowledge_chunks
+                    WHERE collection = %s
+                    LIMIT 20
+                ),
+                keyword_search AS (
+                    SELECT id,
+                           ROW_NUMBER() OVER (
+                               ORDER BY (
+                                   ts_rank(to_tsvector('russian', content) || to_tsvector('simple', content),
+                                           plainto_tsquery('russian', %s) || plainto_tsquery('simple', %s))
+                                   + 0.3 * word_similarity(%s, content)
+                               ) DESC
+                           ) AS kw_rank
+                    FROM knowledge_chunks
+                    WHERE collection = %s
+                    LIMIT 20
+                )
+                SELECT v.filename, v.chunk_index, v.content,
+                       LEAST(1.0, v.vec_sim + (1.0 / (60 + v.vec_rank) + COALESCE(1.0 / (60 + k.kw_rank), 0)) * 5.0) AS similarity
+                FROM vector_search v
+                LEFT JOIN keyword_search k ON v.id = k.id
+                ORDER BY (1.0 / (60 + v.vec_rank) + COALESCE(1.0 / (60 + k.kw_rank), 0)) DESC
                 LIMIT %s
                 """,
-                (str(query_embedding), query_text, collection, limit)
+                (str(query_embedding), str(query_embedding), collection, query_text, query_text, query_text, collection, limit)
             )
             rows = cur.fetchall()
     return pd.DataFrame(rows, columns=["filename", "chunk_index", "content", "similarity"])

@@ -89,11 +89,15 @@ with tab_chat:
             status = st.status(f"Ищу в пространстве «{active_col}»...", expanded=True)
             
             with status:
-                search_query = rewrite_query_with_history(selected_model, query, messages)
-                if search_query != query:
-                    st.markdown(f":material/auto_fix_high: Уточнённый запрос с учётом контекста: *{search_query}*")
+                cleaned_q = clean_search_query(query)
+                if cleaned_q != query:
+                    st.markdown(f":material/spellcheck: Нормализованный запрос: *{cleaned_q}*")
                 
-                st.markdown(":material/hub: Перевожу запрос в вектор (`nomic-embed-text`)...")
+                search_query = rewrite_query_with_history(selected_model, cleaned_q, messages)
+                if search_query != cleaned_q:
+                    st.markdown(f":material/auto_fix_high: Уточнённый с учётом контекста: *{search_query}*")
+                
+                st.markdown(":material/hub: Векторизую запрос (`granite-embedding:278m`)...")
                 q_emb = get_embedding(search_query)
                 
                 st.markdown(":material/database: Выполняю гибридный поиск (Векторы + FTS) в PostgreSQL...")
@@ -123,8 +127,8 @@ with tab_chat:
                 save_chat_message(active_col, "assistant", ans_text, sources_data)
             else:
                 context = "\n\n---\n\n".join(
-                    f"[Файл: {r['filename']}]\n{r['content']}" 
-                    for _, r in df_res.iterrows()
+                    f"[{idx + 1}] (Файл: {r['filename']})\n{r['content']}" 
+                    for idx, (_, r) in enumerate(df_res.iterrows())
                 )
                 prompt = build_rag_prompt(context, query, mode=answer_mode)
                 full_answer = st.write_stream(stream_ollama_response(selected_model, prompt, status, start_time))

@@ -8,7 +8,7 @@ from database import (
     get_indexed_files, delete_file_chunks,
     load_chat_history, clear_chat_history
 )
-from llm import PROMPT_MODES
+from llm import PROMPT_MODES, unload_models
 from ingest import run_pipeline, DOCS_DIR
 
 BADGE_COLORS = [
@@ -207,7 +207,7 @@ def render_sidebar() -> tuple[str, str, str, int]:
         b1, b2, b3 = st.columns(3, vertical_alignment="center")
         with b1:
             with st.popover("", icon=":material/tune:", use_container_width=True, help="Параметры нейросети"):
-                selected_model = st.selectbox("Модель:", ["qwen2.5:3b", "qwen2.5:0.5b"])
+                selected_model = st.selectbox("Модель:", ["qwen3:4b", "qwen3:1.7b", "qwen2.5-coder:3b", "qwen2.5:3b", "qwen2.5:0.5b"])
                 answer_mode = st.selectbox("Стиль:", list(PROMPT_MODES.keys()))
                 min_similarity = st.slider("Порог (%):", 10, 80, 35)
         with b2:

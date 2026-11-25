@@ -14,7 +14,7 @@ PROMPT_MODES = {
 def get_embedding(text: str) -> list[float]:
     resp = requests.post(
         f"{OLLAMA_URL}/api/embed",
-        json={"model": "nomic-embed-text", "input": text, "keep_alive": "15m"},
+        json={"model": "granite-embedding:278m", "input": text, "keep_alive": "15m"},
         timeout=60
     )
     resp.raise_for_status()
@@ -56,14 +56,16 @@ def rewrite_query_with_history(model_name: str, query: str, history: list[dict])
 
 def build_rag_prompt(context: str, query: str, mode: str = "Точный факт-чек") -> str:
     style_instruction = PROMPT_MODES.get(mode, PROMPT_MODES["Точный факт-чек"])
-    return f"""Ты аналитический ассистент. Ответь на вопрос ТОЛЬКО на основе приведённого текста.
+    return f"""/no_think
+Ты аналитический ассистент. Ответь на вопрос ТОЛЬКО на основе пронумерованных фрагментов текста ниже.
 Стиль ответа: {style_instruction}
 Правила:
 1. Не придумывай факты, которых нет в тексте.
-2. Если ответа в тексте нет, напиши ровно одну фразу: "В предоставленных фрагментах ответа нет."
-3. Отвечай на русском языке.
+2. После каждого утверждения или факта ставь ссылку на номер источника в квадратных скобках, например [1] или.
+3. Если ответа в тексте нет, напиши ровно одну фразу: "В предоставленных фрагментах ответа нет."
+4. Отвечай строго на том же языке, на котором задан вопрос пользователя.
 
-Текст:
+Фрагменты:
 {context}
 
 Вопрос: {query}
@@ -101,3 +103,11 @@ def stream_ollama_response(model_name: str, prompt_text: str, status_box=None, s
                     )
                     first_token = False
                 yield chunk["response"]
+
+def unload_models():
+    """Принудительно выгружает модели из оперативной/видеопамяти Ollama."""
+    for m in ["granite-embedding:278m", "qwen2.5:3b", "qwen2.5:0.5b"]:
+        try:
+            requests.post(f"{OLLAMA_URL}/api/generate", json={"model": m, "keep_alive": 0}, timeout=5)
+        except Exception:
+            pass

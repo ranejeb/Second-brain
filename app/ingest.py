@@ -21,7 +21,6 @@ def extract_markdown(filepath: str) -> str:
     _, raw_ext = os.path.splitext(filepath)
     ext = raw_ext.lower()
     if ext == ".pdf":
-        # Быстрая конвертация PDF -> Markdown на C++ (сохраняет таблицы, списки и заголовки)
         return pymupdf4llm.to_markdown(filepath)
     elif ext == ".docx":
         doc = Document(filepath)
@@ -46,7 +45,6 @@ def extract_markdown(filepath: str) -> str:
     return ""
 
 def split_markdown_smart(md_text: str, max_chars: int = 1100) -> list[str]:
-    """Режет Markdown по заголовкам и абзацам, прикрепляя к каждому блоку название текущего раздела."""
     lines = md_text.splitlines()
     sections = []
     current_header = "Общий раздел"
@@ -71,12 +69,10 @@ def split_markdown_smart(md_text: str, max_chars: int = 1100) -> list[str]:
             continue
         
         prefix = f"[Раздел: {header}]\n"
-        # Если весь раздел помещается в окно — оставляем его целым
         if len(prefix) + len(body) <= max_chars:
             final_chunks.append(prefix + body)
             continue
 
-        # Иначе режем раздел по абзацам (не разрывая таблицы и блоки кода)
         paragraphs = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
         curr = []
         curr_len = len(prefix)
@@ -94,7 +90,13 @@ def split_markdown_smart(md_text: str, max_chars: int = 1100) -> list[str]:
 
     return final_chunks
 
-def run_pipeline(collection: str = "Общая", progress_callback=None) -> int:
+def _unload_embedder():
+    try:
+        requests.post(f"{OLLAMA_URL}/api/embed", json={"model": "granite-embedding:278m", "keep_alive": 0}, timeout=5)
+    except Exception:
+        pass
+
+def run_pipeline(collection: str = "Общая", progress_callback=None, stop_event=None) -> int:
     target_dir = os.path.join(DOCS_DIR, collection)
     os.makedirs(target_dir, exist_ok=True)
     
@@ -109,75 +111,91 @@ def run_pipeline(collection: str = "Общая", progress_callback=None) -> int:
     init_db()
     total_added = 0
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT filename FROM knowledge_chunks WHERE collection = %s", (collection,))
-            existing = {filename for (filename,) in cur.fetchall()}
-        
-        new_records = []
-        for folder, fname in files_to_check:
-            if fname in existing:
-                continue
-            fpath = os.path.join(folder, fname)
-            _, raw_ext = os.path.splitext(fname)
-            f_hash = compute_file_hash(fpath)
-
-            # Проверяем: если такой файл по SHA-256 уже векторизован в другом пространстве — клонируем за 2 мс
-            cloned = clone_chunks_by_hash(f_hash, collection, fname, raw_ext.lower())
-            if cloned > 0:
-                total_added += cloned
-                continue
-
-            md_text = extract_markdown(fpath)
-            if not md_text.strip():
-                continue
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT DISTINCT filename FROM knowledge_chunks WHERE collection = %s", (collection,))
+                existing = {filename for (filename,) in cur.fetchall()}
             
-            chunks = split_markdown_smart(md_text, max_chars=1100)
-            for idx, chunk in enumerate(chunks):
-                new_records.append({
-                    "collection": collection,
-                    "filename": fname,
-                    "file_hash": f_hash,
-                    "file_ext": raw_ext.lower(),
-                    "chunk_index": idx,
-                    "content": chunk,
-                    "char_count": len(chunk),
-                    "word_count": len(chunk.split())
-                })
+            for folder, fname in files_to_check:
+                if stop_event and stop_event.is_set():
+                    break
+                if fname in existing:
+                    continue
 
-        if not new_records:
-            return total_added
+                fpath = os.path.join(folder, fname)
+                _, raw_ext = os.path.splitext(fname)
+                f_hash = compute_file_hash(fpath)
 
-        df = pd.DataFrame(new_records)
-        texts = df["content"].tolist()
-        total = len(texts)
-        batch_size = 15
-        all_embeddings = []
+                cloned = clone_chunks_by_hash(f_hash, collection, fname, raw_ext.lower())
+                if cloned > 0:
+                    total_added += cloned
+                    continue
 
-        for i in range(0, total, batch_size):
-            batch = texts[i:i + batch_size]
-            resp = requests.post(
-                f"{OLLAMA_URL}/api/embed",
-                json={"model": "nomic-embed-text", "input": batch, "keep_alive": "15m"},
-                timeout=180
-            )
-            resp.raise_for_status()
-            all_embeddings.extend(resp.json()["embeddings"])
-            
-            if progress_callback:
-                done = min(i + batch_size, total)
-                progress_callback(done / total, f"Векторизация: {done} из {total} ({int(done / total * 100)}%)")
-        
-        with conn.cursor() as cur:
-            for (_, row), emb in zip(df.iterrows(), all_embeddings):
-                cur.execute(
-                    """
-                    INSERT INTO knowledge_chunks 
-                    (collection, filename, file_hash, file_ext, chunk_index, content, char_count, word_count, embedding)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (row["collection"], row["filename"], row["file_hash"], row["file_ext"], row["chunk_index"], 
-                     row["content"], row["char_count"], row["word_count"], str(emb))
-                )
-        conn.commit()
-        return total_added + total
+                md_text = extract_markdown(fpath)
+                if not md_text.strip():
+                    continue
+                
+                chunks = split_markdown_smart(md_text, max_chars=1100)
+                if not chunks:
+                    continue
+
+                df = pd.DataFrame([
+                    {
+                        "collection": collection,
+                        "filename": fname,
+                        "file_hash": f_hash,
+                        "file_ext": raw_ext.lower(),
+                        "chunk_index": idx,
+                        "content": chunk,
+                        "char_count": len(chunk),
+                        "word_count": len(chunk.split())
+                    }
+                    for idx, chunk in enumerate(chunks)
+                ])
+
+                texts = df["content"].tolist()
+                total = len(texts)
+                batch_size = 15
+
+                for i in range(0, total, batch_size):
+                    if stop_event and stop_event.is_set():
+                        # Если нажали Стоп на середине файла, удаляем недоиндексированный хвост этого файла
+                        with conn.cursor() as cur:
+                            cur.execute("DELETE FROM knowledge_chunks WHERE collection = %s AND filename = %s", (collection, fname))
+                        conn.commit()
+                        return total_added
+
+                    batch_texts = texts[i:i + batch_size]
+                    batch_df = df.iloc[i:i + batch_size]
+
+                    resp = requests.post(
+                        f"{OLLAMA_URL}/api/embed",
+                        json={"model": "granite-embedding:278m", "input": batch_texts, "keep_alive": "2m"},
+                        timeout=180
+                    )
+                    resp.raise_for_status()
+                    batch_embs = resp.json()["embeddings"]
+
+                    with conn.cursor() as cur:
+                        for (_, row), emb in zip(batch_df.iterrows(), batch_embs):
+                            cur.execute(
+                                """
+                                INSERT INTO knowledge_chunks 
+                                (collection, filename, file_hash, file_ext, chunk_index, content, char_count, word_count, embedding)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                """,
+                                (row["collection"], row["filename"], row["file_hash"], row["file_ext"], row["chunk_index"], 
+                                 row["content"], row["char_count"], row["word_count"], str(emb))
+                            )
+                    conn.commit()
+                    total_added += len(batch_df)
+
+                    if progress_callback:
+                        done = min(i + batch_size, total)
+                        progress_callback(done / total, f"{fname[:15]}...: {done}/{total} ({int(done / total * 100)}%)")
+
+        return total_added
+    finally:
+        # Всегда выгружаем эмбеддер из памяти по завершении или остановке
+        _unload_embedder()
