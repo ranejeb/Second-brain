@@ -17,6 +17,7 @@ def init_db():
                     id SERIAL PRIMARY KEY,
                     collection TEXT NOT NULL DEFAULT 'Общая',
                     filename TEXT NOT NULL,
+                    file_hash TEXT,
                     file_ext TEXT NOT NULL,
                     chunk_index INT NOT NULL,
                     content TEXT NOT NULL,
@@ -37,9 +38,55 @@ def init_db():
                 );
             """)
             cur.execute("ALTER TABLE knowledge_chunks ADD COLUMN IF NOT EXISTS collection TEXT NOT NULL DEFAULT 'Общая';")
+            cur.execute("ALTER TABLE knowledge_chunks ADD COLUMN IF NOT EXISTS file_hash TEXT;")
             cur.execute("ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS collection TEXT NOT NULL DEFAULT 'Общая';")
+            
+            # Индексы для ускорения фильтрации, полнотекстового и векторного поиска
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_collection ON knowledge_chunks (collection);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_hash ON knowledge_chunks (file_hash);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_fts ON knowledge_chunks USING GIN (to_tsvector('russian', content));")
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_chunks_hnsw ON knowledge_chunks 
+                USING hnsw (embedding vector_cosine_ops) 
+                WITH (m = 16, ef_construction = 64);
+            """)
         conn.commit()
+
+def clone_chunks_by_hash(file_hash: str, target_collection: str, new_filename: str, file_ext: str) -> int:
+    """Мгновенно копирует уже посчитанные векторы, если такой файл по SHA-256 уже есть в БД."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT chunk_index, content, char_count, word_count, embedding
+                FROM knowledge_chunks
+                WHERE file_hash = %s
+                ORDER BY chunk_index ASC
+                """,
+                (file_hash,)
+            )
+            rows = cur.fetchall()
+            if not rows:
+                return 0
+            
+            # Берем уникальный набор чанков одного файла-источника
+            seen_idx = set()
+            inserted = 0
+            for c_idx, content, c_cnt, w_cnt, emb in rows:
+                if c_idx in seen_idx:
+                    continue
+                seen_idx.add(c_idx)
+                cur.execute(
+                    """
+                    INSERT INTO knowledge_chunks 
+                    (collection, filename, file_hash, file_ext, chunk_index, content, char_count, word_count, embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (target_collection, new_filename, file_hash, file_ext, c_idx, content, c_cnt, w_cnt, emb)
+                )
+                inserted += 1
+        conn.commit()
+        return inserted
 
 def get_db_collections() -> set[str]:
     cols = {"Общая"}
@@ -94,7 +141,6 @@ def search_similar_chunks(collection: str, query_embedding: list[float], query_t
                 if rows:
                     return pd.DataFrame(rows, columns=["filename", "chunk_index", "content", "similarity"])
 
-            # Настоящий гибридный поиск: Косинусное сходство + Полнотекстовый ранг PostgreSQL (ts_rank)
             cur.execute(
                 """
                 SELECT filename, chunk_index, content,
