@@ -1,19 +1,9 @@
-import os
 import re
-import shutil
 import time
 from collections import Counter
 import pandas as pd
 import streamlit as st
 import plotly.express as px
-
-from database import (
-    init_db, get_db_collections, delete_collection_data,
-    get_indexed_files, delete_file_chunks, search_similar_chunks,
-    get_analytics_df, load_chat_history, save_chat_message, clear_chat_history
-)
-from llm import PROMPT_MODES, get_embedding, rewrite_query_with_history, build_rag_prompt, stream_ollama_response
-from ingest import run_pipeline, DOCS_DIR
 
 st.set_page_config(
     page_title="Второй Мозг | Workspaces",
@@ -21,6 +11,15 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+from database import (
+    init_db, search_similar_chunks, get_analytics_df,
+    load_chat_history, save_chat_message
+)
+from embedder import embed_query
+from llm import LLM_MODEL, build_rag_prompt, stream_ollama_response
+from sidebar import render_sidebar, is_any_indexing_running
+from text_utils import clean_search_query
 
 st.markdown("""
 <style>
@@ -36,14 +35,6 @@ st.markdown("""
 
 init_db()
 
-def get_all_collections() -> list[str]:
-    cols = get_db_collections()
-    if os.path.exists(DOCS_DIR):
-        for d in os.listdir(DOCS_DIR):
-            if os.path.isdir(os.path.join(DOCS_DIR, d)) and not d.startswith("."):
-                cols.add(d)
-    return sorted(list(cols))
-
 def render_sources(sources_list: list[dict]):
     if not sources_list:
         return
@@ -51,10 +42,10 @@ def render_sources(sources_list: list[dict]):
         for src in sources_list:
             score_pct = round(src["similarity"] * 100, 1)
             with st.container(border=True):
-                st.markdown(f":material/description: **{src['filename']}** · Фрагмент `#{src['chunk_index']}` · Схожесть: `{score_pct}%`")
+                st.markdown(f":material/description: **{src['filename']}** · Блок `#{src['chunk_index']}` · Схожесть: `{score_pct}%`")
                 st.caption(src["content"])
-from sidebar import render_sidebar
-active_col, selected_model, answer_mode, min_similarity = render_sidebar()
+
+active_col, answer_mode = render_sidebar()
 
 st.markdown(f"# :material/neurology: Второй Мозг · `{active_col}`")
 st.caption(f"Изолированный поиск только по документам пространства «{active_col}»")
@@ -76,7 +67,11 @@ with tab_chat:
             if msg.get("sources"):
                 render_sources(msg["sources"])
 
-query = st.chat_input(f"Спросить по документам из «{active_col}»...")
+indexing_now = is_any_indexing_running()
+query = st.chat_input(
+    "Идёт фоновая индексация (можно читать чат и аналитику)..." if indexing_now else f"Спросить по документам из «{active_col}»...",
+    disabled=indexing_now
+)
 
 with tab_chat:
     if query:
@@ -89,45 +84,34 @@ with tab_chat:
             status = st.status(f"Ищу в пространстве «{active_col}»...", expanded=True)
             
             with status:
-                search_query = rewrite_query_with_history(selected_model, query, messages)
-                if search_query != query:
-                    st.markdown(f":material/auto_fix_high: Уточнённый запрос с учётом контекста: *{search_query}*")
+                cleaned_q = clean_search_query(query)
+                if cleaned_q != query:
+                    st.markdown(f":material/spellcheck: Очищенный запрос: *{cleaned_q}*")
                 
-                st.markdown(":material/hub: Перевожу запрос в вектор (`nomic-embed-text`)...")
-                q_emb = get_embedding(search_query)
+                st.markdown(":material/hub: Векторизую запрос (ONNX `multilingual-e5-small`)...")
+                q_emb = embed_query(cleaned_q)
                 
-                st.markdown(":material/database: Выполняю гибридный поиск (Векторы + FTS) в PostgreSQL...")
-                df_res = search_similar_chunks(active_col, q_emb, query_text=search_query, limit=4)
+                st.markdown(":material/database: Гибридный поиск (FULL OUTER JOIN RRF + Auto-Merging)...")
+                df_res = search_similar_chunks(active_col, q_emb, query_text=cleaned_q, limit=2)
                 
                 if df_res.empty:
-                    status.update(label=f"В пуле «{active_col}» пока нет документов", state="error", expanded=False)
+                    status.update(label="Релевантных совпадений не найдено (LLM не запускалась)", state="complete", expanded=False)
                 else:
-                    best_score = round(df_res["similarity"].max() * 100, 1)
                     files_found = ", ".join(df_res["filename"].unique())
-                    st.markdown(f":material/find_in_page: Найдены совпадения в: **{files_found}** (до **{best_score}%**)")
-                    
-                    if best_score < min_similarity:
-                        status.update(label=f"Совпадение ниже порога ({best_score}% < {min_similarity}%)", state="complete", expanded=False)
-                    else:
-                        st.markdown(f":material/memory: Загружаю `{selected_model}` и формулирую ответ...")
+                    st.markdown(f":material/find_in_page: Отобраны разделы из: **{files_found}** ({len(df_res)} блоков)")
+                    st.markdown(f":material/memory: Формулирую ответ (`{LLM_MODEL}`)...")
 
             if df_res.empty:
-                ans_text = f"В пространстве **«{active_col}»** пока нет ни одного файла. Загрузите PDF, TXT или MD через боковую панель слева."
-                st.warning(ans_text, icon=":material/warning:")
-                save_chat_message(active_col, "assistant", ans_text)
-            elif round(df_res["similarity"].max() * 100, 1) < min_similarity:
-                ans_text = f"В документах пространства **«{active_col}»** не найдено точного ответа (максимальная схожесть всего **{round(df_res['similarity'].max() * 100, 1)}%**)."
+                ans_text = f"В документах пространства **«{active_col}»** совпадений не найдено (ни одно совпадение не прошло порог `vec_sim >= 0.76` или `kw_rank <= 3`)."
                 st.info(ans_text, icon=":material/info:")
-                sources_data = df_res.to_dict("records")
-                render_sources(sources_data)
-                save_chat_message(active_col, "assistant", ans_text, sources_data)
+                save_chat_message(active_col, "assistant", ans_text)
             else:
                 context = "\n\n---\n\n".join(
-                    f"[Файл: {r['filename']}]\n{r['content']}" 
-                    for _, r in df_res.iterrows()
+                    f"[{idx + 1}] (Файл: {r['filename']}, блок #{r['chunk_index']})\n{r['content']}" 
+                    for idx, (_, r) in enumerate(df_res.iterrows())
                 )
-                prompt = build_rag_prompt(context, query, mode=answer_mode)
-                full_answer = st.write_stream(stream_ollama_response(selected_model, prompt, status, start_time))
+                prompt = build_rag_prompt(context[:4500], cleaned_q, mode=answer_mode)
+                full_answer = st.write_stream(stream_ollama_response(prompt, status, start_time))
                 sources_data = df_res.to_dict("records")
                 render_sources(sources_data)
                 save_chat_message(active_col, "assistant", full_answer, sources_data)

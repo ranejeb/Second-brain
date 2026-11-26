@@ -1,12 +1,11 @@
 import hashlib
 import os
 import re
-import requests
 import pandas as pd
 import pymupdf4llm
 from docx import Document
 from database import get_conn, init_db, clone_chunks_by_hash
-from llm import OLLAMA_URL
+from embedder import embed_passages_generator
 
 DOCS_DIR = "/docs"
 
@@ -21,7 +20,6 @@ def extract_markdown(filepath: str) -> str:
     _, raw_ext = os.path.splitext(filepath)
     ext = raw_ext.lower()
     if ext == ".pdf":
-        # Быстрая конвертация PDF -> Markdown на C++ (сохраняет таблицы, списки и заголовки)
         return pymupdf4llm.to_markdown(filepath)
     elif ext == ".docx":
         doc = Document(filepath)
@@ -45,9 +43,16 @@ def extract_markdown(filepath: str) -> str:
             return f.read()
     return ""
 
-def split_markdown_smart(md_text: str, max_chars: int = 1100) -> list[str]:
-    """Режет Markdown по заголовкам и абзацам, прикрепляя к каждому блоку название текущего раздела."""
-    lines = md_text.splitlines()
+def split_code_aware_markdown(md_text: str, min_chars: int = 1400, max_chars: int = 1800) -> list[str]:
+    code_blocks = {}
+    def _protect_code(match):
+        key = f"__CODE_BLOCK_{len(code_blocks)}__"
+        code_blocks[key] = match.group(0)
+        return key
+
+    protected_text = re.sub(r"```[\s\(\S\)]*?```", _protect_code, md_text)
+
+    lines = protected_text.splitlines()
     sections = []
     current_header = "Общий раздел"
     buffer = []
@@ -65,36 +70,39 @@ def split_markdown_smart(md_text: str, max_chars: int = 1100) -> list[str]:
     if buffer:
         sections.append((current_header, "\n".join(buffer).strip()))
 
+    def _restore_code(txt: str) -> str:
+        for k, v in code_blocks.items():
+            txt = txt.replace(k, v)
+        return txt
+
     final_chunks = []
     for header, body in sections:
         if not body or len(body) < 35:
             continue
         
         prefix = f"[Раздел: {header}]\n"
-        # Если весь раздел помещается в окно — оставляем его целым
-        if len(prefix) + len(body) <= max_chars:
-            final_chunks.append(prefix + body)
-            continue
-
-        # Иначе режем раздел по абзацам (не разрывая таблицы и блоки кода)
         paragraphs = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
         curr = []
         curr_len = len(prefix)
 
         for p in paragraphs:
-            if curr_len + len(p) > max_chars and curr:
+            restored_p = _restore_code(p)
+            p_len = len(restored_p)
+
+            if curr and (curr_len + p_len > max_chars or curr_len >= min_chars):
                 final_chunks.append(prefix + "\n\n".join(curr))
                 curr = []
                 curr_len = len(prefix)
-            curr.append(p)
-            curr_len += len(p) + 2
+
+            curr.append(restored_p)
+            curr_len += p_len + 2
 
         if curr:
             final_chunks.append(prefix + "\n\n".join(curr))
 
     return final_chunks
 
-def run_pipeline(collection: str = "Общая", progress_callback=None) -> int:
+def run_pipeline(collection: str = "Общая", progress_callback=None, stop_event=None) -> int:
     target_dir = os.path.join(DOCS_DIR, collection)
     os.makedirs(target_dir, exist_ok=True)
     
@@ -114,15 +122,16 @@ def run_pipeline(collection: str = "Общая", progress_callback=None) -> int:
             cur.execute("SELECT DISTINCT filename FROM knowledge_chunks WHERE collection = %s", (collection,))
             existing = {filename for (filename,) in cur.fetchall()}
         
-        new_records = []
         for folder, fname in files_to_check:
+            if stop_event and stop_event.is_set():
+                break
             if fname in existing:
                 continue
+
             fpath = os.path.join(folder, fname)
             _, raw_ext = os.path.splitext(fname)
             f_hash = compute_file_hash(fpath)
 
-            # Проверяем: если такой файл по SHA-256 уже векторизован в другом пространстве — клонируем за 2 мс
             cloned = clone_chunks_by_hash(f_hash, collection, fname, raw_ext.lower())
             if cloned > 0:
                 total_added += cloned
@@ -132,9 +141,12 @@ def run_pipeline(collection: str = "Общая", progress_callback=None) -> int:
             if not md_text.strip():
                 continue
             
-            chunks = split_markdown_smart(md_text, max_chars=1100)
-            for idx, chunk in enumerate(chunks):
-                new_records.append({
+            chunks = split_code_aware_markdown(md_text, min_chars=1400, max_chars=1800)
+            if not chunks:
+                continue
+
+            df = pd.DataFrame([
+                {
                     "collection": collection,
                     "filename": fname,
                     "file_hash": f_hash,
@@ -143,41 +155,44 @@ def run_pipeline(collection: str = "Общая", progress_callback=None) -> int:
                     "content": chunk,
                     "char_count": len(chunk),
                     "word_count": len(chunk.split())
-                })
+                }
+                for idx, chunk in enumerate(chunks)
+            ])
 
-        if not new_records:
-            return total_added
+            texts = df["content"].tolist()
+            total = len(texts)
+            batch_size = 8
 
-        df = pd.DataFrame(new_records)
-        texts = df["content"].tolist()
-        total = len(texts)
-        batch_size = 15
-        all_embeddings = []
+            for start_idx, batch_embs in embed_passages_generator(texts, batch_size=batch_size):
+                if stop_event and stop_event.is_set():
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM knowledge_chunks WHERE collection = %s AND filename = %s", (collection, fname))
+                    conn.commit()
+                    return total_added
 
-        for i in range(0, total, batch_size):
-            batch = texts[i:i + batch_size]
-            resp = requests.post(
-                f"{OLLAMA_URL}/api/embed",
-                json={"model": "nomic-embed-text", "input": batch, "keep_alive": "15m"},
-                timeout=180
-            )
-            resp.raise_for_status()
-            all_embeddings.extend(resp.json()["embeddings"])
-            
-            if progress_callback:
-                done = min(i + batch_size, total)
-                progress_callback(done / total, f"Векторизация: {done} из {total} ({int(done / total * 100)}%)")
-        
-        with conn.cursor() as cur:
-            for (_, row), emb in zip(df.iterrows(), all_embeddings):
-                cur.execute(
-                    """
-                    INSERT INTO knowledge_chunks 
-                    (collection, filename, file_hash, file_ext, chunk_index, content, char_count, word_count, embedding)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (row["collection"], row["filename"], row["file_hash"], row["file_ext"], row["chunk_index"], 
-                     row["content"], row["char_count"], row["word_count"], str(emb))
-                )
-        conn.commit()
-        return total_added + total
+                batch_df = df.iloc[start_idx:start_idx + len(batch_embs)]
+                insert_rows = [
+                    (
+                        row["collection"], row["filename"], row["file_hash"], row["file_ext"],
+                        row["chunk_index"], row["content"], row["char_count"], row["word_count"], str(emb)
+                    )
+                    for (_, row), emb in zip(batch_df.iterrows(), batch_embs)
+                ]
+
+                with conn.cursor() as cur:
+                    cur.executemany(
+                        """
+                        INSERT INTO knowledge_chunks 
+                        (collection, filename, file_hash, file_ext, chunk_index, content, char_count, word_count, embedding)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        insert_rows
+                    )
+                conn.commit()
+                total_added += len(insert_rows)
+
+                if progress_callback:
+                    done = min(start_idx + len(batch_embs), total)
+                    progress_callback(done / total, f"{fname[:15]}...: {done}/{total} ({int(done / total * 100)}%)")
+
+    return total_added

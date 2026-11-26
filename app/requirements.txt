@@ -5,3 +5,4 @@ plotly
 requests
 pymupdf4llm
 python-docx
+fastembed

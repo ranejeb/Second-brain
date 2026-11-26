@@ -1,25 +1,10 @@
-# Секреты и переменные окружения
 .env
-*.env
-
-# Тяжёлые Docker volumes (база данных и веса нейросетей)
 pgdata/
 ollama_models/
-
-# Личные документы пользователей (оставляем только пустую структуру папок)
 docs/*
 !docs/.gitkeep
-
-# Кэш и служебные файлы Python / VS Code / ОС
-__pycache__/
-*.py[cod]
-*$py.class
-.venv/
-venv/
-.vscode/
-.idea/
-.DS_Store
-*.log
-BACKLOG.local.md
 app/.fastembed_cache/
 app/__pycache__/
+__pycache__/
+*.pyc
+.DS_Store
