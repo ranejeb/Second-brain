@@ -21,3 +21,5 @@ venv/
 .DS_Store
 *.log
 BACKLOG.local.md
+app/.fastembed_cache/
+app/__pycache__/
